@@ -82,6 +82,15 @@ class SimulationEngine:
         self.gcode_actions: list[SimulationAction] = []
         self.action_index: int = 0
 
+        # Cached quality scores — only recomputed after extruding moves
+        self._cached_quality_scores: dict[str, float] = {
+            "adhesion": 0.0,
+            "warping": 0.0,
+            "stringing": 0.0,
+            "dimensional_error": 0.0,
+        }
+        self._quality_dirty: bool = False
+
     # ------------------------------------------------------------------ #
     #  G-code loading                                                     #
     # ------------------------------------------------------------------ #
@@ -158,6 +167,7 @@ class SimulationEngine:
 
         elif action.action_type == "move":
             self._execute_move(action, extrude=True)
+            self._quality_dirty = True
 
         elif action.action_type == "travel":
             self._execute_move(action, extrude=False)
@@ -201,7 +211,14 @@ class SimulationEngine:
     # ------------------------------------------------------------------ #
 
     def _execute_move(self, action: SimulationAction, extrude: bool) -> None:
-        """Plan and execute a move, stepping physics for each waypoint."""
+        """Plan and execute a move, stepping physics for each waypoint.
+
+        For moves with many waypoints the full physics update (PID, thermal,
+        extrusion, cooling) is batched: it runs every *N*-th waypoint while
+        the intermediate waypoints only update the kinematic position and
+        accumulate time.  This preserves accuracy for short moves while
+        greatly reducing computation for long, straight segments.
+        """
         dt = self.time_stepper.dt
 
         # Resolve target position (keep current if axis not specified)
@@ -218,72 +235,96 @@ class SimulationEngine:
         if not waypoints:
             return
 
+        n_waypoints = len(waypoints)
+
+        # Determine batching stride: step physics every *stride* waypoints.
+        # Short moves (< 20 waypoints) keep per-waypoint physics; longer
+        # moves batch more aggressively (up to every 10th waypoint).
+        if n_waypoints < 20:
+            stride = 1
+        elif n_waypoints < 100:
+            stride = 5
+        else:
+            stride = 10
+
+        accumulated_dt = 0.0  # time accumulated since last physics step
+
         # Process each waypoint
-        for wx, wy, wz, speed in waypoints:
-            # Update position in state
+        for i, (wx, wy, wz, speed) in enumerate(waypoints):
+            # Update position in state (always — this is cheap)
             self.state.x = wx
             self.state.y = wy
             self.state.z = wz
             self.state.current_speed = speed
 
-            # PID update
-            hotend_duty = self.hotend_pid.update(
-                self.state.hotend_target, self.state.hotend_temp, dt,
-            )
-            bed_duty = self.bed_pid.update(
-                self.state.bed_target, self.state.bed_temp, dt,
-            )
-            self.state.hotend_duty = hotend_duty
-            self.state.bed_duty = bed_duty
+            accumulated_dt += dt
 
-            # Thermal step
-            mass_flow = self.state.mass_flow_rate if extrude else 0.0
-            self.thermal.step(
-                dt,
-                hotend_duty,
-                bed_duty,
-                self.cooling.fan_speed,
-                mass_flow,
-                self.state.ambient_temp,  # filament enters at ambient
-                self.state.ambient_temp,
-            )
+            # Full physics update on stride boundaries and the final waypoint
+            is_physics_step = (i % stride == 0) or (i == n_waypoints - 1)
 
-            # Sync thermal state back
-            self.state.hotend_temp = self.thermal.hotend_temp
-            self.state.bed_temp = self.thermal.bed_temp
-            self.state.chamber_temp = self.thermal.chamber_temp
+            if is_physics_step:
+                step_dt = accumulated_dt  # cover the whole accumulated interval
 
-            # Extrusion flow (only for extrusion moves)
-            if extrude and speed > 0.0:
-                layer_height = self.config.default_layer_height
-                line_width = self.config.nozzle_diameter
-                flow = self.extrusion.compute_flow(
-                    speed, layer_height, line_width,
-                    self.material, self.state.hotend_temp,
+                # PID update
+                hotend_duty = self.hotend_pid.update(
+                    self.state.hotend_target, self.state.hotend_temp, step_dt,
                 )
-                self.state.flow_rate = flow["volume_flow_mm3s"]
-                self.state.mass_flow_rate = flow["mass_flow_rate"]
-                self.state.viscosity = flow["viscosity"]
-                self.state.pressure_drop = flow["pressure_drop"]
-                self.state.die_swell = flow["die_swell"]
+                bed_duty = self.bed_pid.update(
+                    self.state.bed_target, self.state.bed_temp, step_dt,
+                )
+                self.state.hotend_duty = hotend_duty
+                self.state.bed_duty = bed_duty
 
-                # Quality: dimensional accuracy
-                self.quality.compute_dimensional_accuracy(
-                    line_width, flow["actual_line_width"],
+                # Thermal step
+                mass_flow = self.state.mass_flow_rate if extrude else 0.0
+                self.thermal.step(
+                    step_dt,
+                    hotend_duty,
+                    bed_duty,
+                    self.cooling.fan_speed,
+                    mass_flow,
+                    self.state.ambient_temp,
+                    self.state.ambient_temp,
                 )
 
-            # Cooling update
-            self.cooling.update_fan(dt, self.state.fan_target)
-            self.state.fan_speed = self.cooling.fan_speed
+                # Sync thermal state back
+                self.state.hotend_temp = self.thermal.hotend_temp
+                self.state.bed_temp = self.thermal.bed_temp
+                self.state.chamber_temp = self.thermal.chamber_temp
 
-            # Energy tracking
-            self.state.hotend_power = self.thermal.hotend_power
-            self.state.bed_power = self.thermal.bed_power
-            self.state.total_energy_j += (
-                self.thermal.hotend_power + self.thermal.bed_power
-            ) * dt
+                # Extrusion flow (only for extrusion moves)
+                if extrude and speed > 0.0:
+                    layer_height = self.config.default_layer_height
+                    line_width = self.config.nozzle_diameter
+                    flow = self.extrusion.compute_flow(
+                        speed, layer_height, line_width,
+                        self.material, self.state.hotend_temp,
+                    )
+                    self.state.flow_rate = flow["volume_flow_mm3s"]
+                    self.state.mass_flow_rate = flow["mass_flow_rate"]
+                    self.state.viscosity = flow["viscosity"]
+                    self.state.pressure_drop = flow["pressure_drop"]
+                    self.state.die_swell = flow["die_swell"]
 
-            # Advance simulation clock
+                    # Quality: dimensional accuracy
+                    self.quality.compute_dimensional_accuracy(
+                        line_width, flow["actual_line_width"],
+                    )
+
+                # Cooling update
+                self.cooling.update_fan(step_dt, self.state.fan_target)
+                self.state.fan_speed = self.cooling.fan_speed
+
+                # Energy tracking
+                self.state.hotend_power = self.thermal.hotend_power
+                self.state.bed_power = self.thermal.bed_power
+                self.state.total_energy_j += (
+                    self.thermal.hotend_power + self.thermal.bed_power
+                ) * step_dt
+
+                accumulated_dt = 0.0  # reset accumulator
+
+            # Advance simulation clock (always, per-waypoint)
             self.state.sim_time += dt
             self.state.step_count += 1
 
@@ -294,19 +335,41 @@ class SimulationEngine:
     # ------------------------------------------------------------------ #
 
     def _wait_for_temp(self, heater: str) -> None:
-        """Simulate until the specified heater is within 2 deg C of target."""
-        dt = self.time_stepper.dt
-        max_wait_steps = int(600.0 / dt)  # safety cap: 600 s
+        """Simulate until the specified heater is within 2 deg C of target.
 
-        for _ in range(max_wait_steps):
+        Uses a fast-forward strategy: a coarse time step (0.1 s) while
+        the temperature is far from the target (> 5 deg C away), switching
+        to the normal fine time step once close.  This dramatically reduces
+        the number of physics iterations during long thermal equilibration
+        phases (M109 / M190).  A 120 s safety cap prevents infinite loops.
+        """
+        fine_dt = self.time_stepper.dt
+        coarse_dt = 0.1  # 100x larger than typical 0.001 s fine step
+        close_threshold = 5.0  # switch to fine dt within this range
+        tolerance = 2.0  # target reached when within this range
+        max_wait_time = 120.0  # seconds of simulated time before giving up
+        elapsed = 0.0
+
+        while elapsed < max_wait_time:
+            # Read the relevant temperature and target
             if heater == "hotend":
-                if abs(self.state.hotend_temp - self.state.hotend_target) <= 2.0:
-                    break
+                current = self.state.hotend_temp
+                target = self.state.hotend_target
             else:
-                if abs(self.state.bed_temp - self.state.bed_target) <= 2.0:
-                    break
+                current = self.state.bed_temp
+                target = self.state.bed_target
+
+            temp_error = abs(current - target)
+
+            # Check convergence
+            if temp_error <= tolerance:
+                break
+
+            # Choose time step based on distance from target
+            dt = fine_dt if temp_error <= close_threshold else coarse_dt
 
             self.step_physics(dt)
+            elapsed += dt
 
     # ------------------------------------------------------------------ #
     #  Single physics time step (no G-code advance)                      #
@@ -416,6 +479,15 @@ class SimulationEngine:
         self.gcode_actions = []
         self.action_index = 0
 
+        # Quality cache reset
+        self._cached_quality_scores = {
+            "adhesion": 0.0,
+            "warping": 0.0,
+            "stringing": 0.0,
+            "dimensional_error": 0.0,
+        }
+        self._quality_dirty = False
+
         # Time stepper reset
         self.time_stepper.reset()
 
@@ -430,11 +502,19 @@ class SimulationEngine:
 
         Keys include quality scores, temperatures, energy consumption,
         progress fraction, and fault status.
+
+        Quality scores are only recomputed when the last action was an
+        extruding move (``_quality_dirty`` flag), avoiding redundant work
+        during temperature waits, travels, fan changes, etc.
         """
         total = max(len(self.gcode_actions), 1)
         progress = self.action_index / total
 
-        quality_scores = self.quality.get_quality_scores()
+        if self._quality_dirty:
+            self._cached_quality_scores = self.quality.get_quality_scores()
+            self._quality_dirty = False
+
+        quality_scores = self._cached_quality_scores
 
         return {
             # Quality

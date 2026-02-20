@@ -42,7 +42,7 @@ class PrusaCoreOneEnv(gymnasium.Env):
     (see :func:`digiprinter.envs.observations.observation_space`).
     """
 
-    metadata = {"render_modes": ["human"], "render_fps": 30}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     # ------------------------------------------------------------------ #
     #  Construction                                                       #
@@ -71,6 +71,12 @@ class PrusaCoreOneEnv(gymnasium.Env):
         # Internal bookkeeping
         self._step_count: int = 0
         self._rng: np.random.Generator = np.random.default_rng()
+
+        # Renderer (lazily created to avoid matplotlib import during training)
+        self._renderer = None
+        if self.render_mode in ("human", "rgb_array"):
+            from digiprinter.envs.renderer import PrinterRenderer
+            self._renderer = PrinterRenderer()
 
         # ----- Spaces -----------------------------------------------------
         self.action_space = gymnasium.spaces.Box(
@@ -141,6 +147,9 @@ class PrusaCoreOneEnv(gymnasium.Env):
         self.reward_calc.reset()
 
         self._step_count = 0
+
+        if self._renderer is not None:
+            self._renderer.reset()
 
         obs = build_observation(self.engine.state, self.config)
         info = self.engine.get_info()
@@ -246,19 +255,33 @@ class PrusaCoreOneEnv(gymnasium.Env):
     #  render                                                             #
     # ------------------------------------------------------------------ #
 
-    def render(self) -> None:
-        """Print a one-line status summary when ``render_mode='human'``."""
-        if self.render_mode != "human":
-            return
+    def render(self) -> np.ndarray | None:
+        """Render the environment.
 
-        s = self.engine.state
+        When ``render_mode='human'``, updates the live matplotlib dashboard.
+        When ``render_mode='rgb_array'``, returns the dashboard as an
+        (H, W, 3) uint8 numpy array.
+        """
+        if self.render_mode is None:
+            return None
+
+        if self._renderer is None:
+            return None
+
+        state = self.engine.state
         info = self.engine.get_info()
-        print(
-            f"step={self._step_count:>6d}  "
-            f"progress={info['progress']:.1%}  "
-            f"hotend={s.hotend_temp:.1f}/{s.hotend_target:.0f}°C  "
-            f"bed={s.bed_temp:.1f}/{s.bed_target:.0f}°C  "
-            f"fan={s.fan_speed:.0%}  "
-            f"speed={s.current_speed:.1f}mm/s  "
-            f"fault={'YES' if s.fault else 'no'}"
-        )
+        self._renderer.update(state, info)
+
+        if self.render_mode == "rgb_array":
+            return self._renderer.get_rgb_array()
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  close                                                              #
+    # ------------------------------------------------------------------ #
+
+    def close(self) -> None:
+        """Clean up renderer resources."""
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
