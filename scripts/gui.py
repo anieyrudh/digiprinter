@@ -270,14 +270,14 @@ class DigiPrinterGUI:
             fg=self.TEXT, bg=self.PANEL_BG, width=10, anchor="w",
         ).pack(side=tk.LEFT)
 
-        bar = tk.Canvas(frame, height=14, bg="#0a0a1a", highlightthickness=0)
-        bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
-
         val_label = tk.Label(
             frame, text="--", font=("Courier", 9, "bold"),
             fg=color, bg=self.PANEL_BG, width=9, anchor="e",
         )
         val_label.pack(side=tk.RIGHT)
+
+        bar = tk.Canvas(frame, height=14, bg="#0a0a1a", highlightthickness=0)
+        bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
 
         return {"bar": bar, "label": val_label, "color": color}
 
@@ -424,8 +424,10 @@ class DigiPrinterGUI:
             cx, cy = state.x, state.y
             is_ext = state.is_printing
 
-            self.path_segments.append((prev_x, prev_y, cx, cy, is_ext))
-            prev_x, prev_y = cx, cy
+            # Only record path segment if we actually moved
+            if abs(cx - prev_x) > 0.01 or abs(cy - prev_y) > 0.01:
+                self.path_segments.append((prev_x, prev_y, cx, cy, is_ext))
+                prev_x, prev_y = cx, cy
 
             # Schedule UI refresh on the main thread
             if not self._closing:
@@ -434,8 +436,11 @@ class DigiPrinterGUI:
             if terminated or truncated:
                 break
 
-            # Small delay so the user can see the animation.
-            time.sleep(0.02)
+            # Delay: faster during warmup (temp waits), slower during printing
+            if state.current_speed > 0:
+                time.sleep(0.03)  # printing — animate slowly
+            else:
+                time.sleep(0.005)  # warmup — go fast
 
         env.close()
 
@@ -499,11 +504,17 @@ class DigiPrinterGUI:
             self.fault_label.config(text=f"FAULT: {fault}")
 
         # -- Stats lines --
+        if state.current_speed > 0:
+            phase = "PRINTING"
+        elif state.hotend_temp > 100:
+            phase = "HEATING"
+        else:
+            phase = "WARMUP"
         self.stats_line1.config(
             text=(
                 f"Step: {step + 1} / {self.total_steps}   |   "
                 f"Reward: {self.total_reward:.2f}   |   "
-                f"Speed: {state.current_speed:.0f} mm/s"
+                f"Speed: {state.current_speed:.0f} mm/s   |   {phase}"
             )
         )
         self.stats_line2.config(
