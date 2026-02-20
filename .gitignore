@@ -27,3 +27,8 @@ runs/
 checkpoints/
 *.zip
 *.tar.gz
+
+# Keep trained models
+!checkpoints/sac_prusa/sac_final.zip
+!checkpoints/sac_prusa/best_model.zip
+!runs/sac/evaluations.npz
