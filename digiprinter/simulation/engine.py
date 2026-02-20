@@ -170,6 +170,20 @@ class SimulationEngine:
             self._quality_dirty = True
 
         elif action.action_type == "travel":
+            # Compute stringing/ooze during travel moves
+            x_t = action.x if action.x is not None else self.state.x
+            y_t = action.y if action.y is not None else self.state.y
+            travel_dist = np.sqrt(
+                (x_t - self.state.x) ** 2 + (y_t - self.state.y) ** 2
+            )
+            if travel_dist > 0.1:
+                retract_frac = 1.0 if self.state.retracted else 0.0
+                string_len = self.quality.compute_stringing(
+                    self.state.viscosity, travel_dist,
+                    self.material, retract_frac,
+                )
+                self.state.stringing_amount = self.quality.total_stringing
+                self._quality_dirty = True
             self._execute_move(action, extrude=False)
 
         elif action.action_type == "retract":
@@ -310,6 +324,36 @@ class SimulationEngine:
                     self.quality.compute_dimensional_accuracy(
                         line_width, flow["actual_line_width"],
                     )
+
+                    # Quality: adhesion (inter-layer bonding)
+                    # Estimate layer time as time since last Z change.
+                    # The interface temp depends on how long the previous
+                    # layer has been cooling — approximate as total sim
+                    # time divided by layers (capped for realism).
+                    layers = max(self.state.current_layer, 1)
+                    layer_time = max(self.state.sim_time / layers, 0.5)
+                    layer_time = min(layer_time, 30.0)  # cap at 30s
+                    interface_temp = ThermalModel.interface_temperature(
+                        self.state.hotend_temp,
+                        self.state.chamber_temp,
+                        layer_time,
+                        self.material.thermal_diffusivity,
+                    )
+                    adhesion = self.quality.compute_adhesion(
+                        interface_temp, layer_time, self.material,
+                        self.state.bed_adhesion_factor,
+                    )
+                    self.state.adhesion_quality = adhesion
+
+                    # Quality: warping (per-segment footprint, not full bed)
+                    delta_t = self.state.hotend_temp - self.state.ambient_temp
+                    # Segment footprint: line_width * segment_length
+                    seg_len = speed * step_dt  # mm traveled this segment
+                    seg_footprint = line_width * max(seg_len, 0.1)  # mm²
+                    warp = self.quality.compute_warping(
+                        delta_t, seg_footprint, self.material, adhesion,
+                    )
+                    self.state.warping_amount = self.quality.total_warping
 
                 # Cooling update
                 self.cooling.update_fan(step_dt, self.state.fan_target)
